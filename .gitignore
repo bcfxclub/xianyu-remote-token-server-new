@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.template
+__pycache__/
+*.py[cod]
+*.log
+logs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+test-output/

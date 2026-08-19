@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any, Dict, Optional
 
@@ -37,7 +38,15 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
 logger = logging.getLogger(__name__)
+
+
+def api_key_is_valid(candidate: Optional[str]) -> bool:
+    """以恒定时间方式校验 API Key，避免泄露密钥内容。"""
+    if not API_KEY or not candidate:
+        return False
+    return secrets.compare_digest(candidate, API_KEY)
 
 # FastAPI 应用
 app = FastAPI(
@@ -193,8 +202,12 @@ async def request_im_token(
     cookies = trans_cookies(cookies_str)
 
     # 获取签名所需的 token
-    m_h5_token = cookies.get("_m_h5_tk", "")
-    signing_token = m_h5_token.split("_")[0] if m_h5_token else ""
+    m_h5_token = cookies.get("_m_h5_tk", "").strip()
+    if not m_h5_token:
+        raise ValueError("Cookie 缺少 _m_h5_tk")
+    signing_token = m_h5_token.split("_", 1)[0].strip()
+    if not signing_token:
+        raise ValueError("Cookie 中的 _m_h5_tk 格式无效")
 
     # 构造请求
     timestamp = str(int(time.time() * 1000))
@@ -353,8 +366,9 @@ async def invoke_token(
         logger.error("API_KEY 未配置，服务不可用")
         raise HTTPException(status_code=500, detail="服务未配置")
 
-    if not x_api_key or x_api_key != API_KEY:
-        logger.warning(f"非法请求 - IP: {client_ip}，API Key: {x_api_key or '缺失'}")
+    if not api_key_is_valid(x_api_key):
+        reason = "缺失" if not x_api_key else "无效"
+        logger.warning(f"非法请求 - IP: {client_ip}，API Key {reason}")
         raise HTTPException(status_code=403, detail="API Key 无效")
 
     # ===== 2. 验证请求格式 =====
@@ -369,6 +383,26 @@ async def invoke_token(
         return TokenResponse(
             success=False,
             message="Cookie 不能为空",
+        )
+
+    try:
+        cookie_map = trans_cookies(cookies)
+    except ValueError:
+        return TokenResponse(
+            success=False,
+            message="Cookie 格式无效",
+        )
+
+    if not cookie_map.get("_m_h5_tk"):
+        return TokenResponse(
+            success=False,
+            message="Cookie 缺少 _m_h5_tk",
+        )
+
+    if not (cookie_map.get("unb") or cookie_map.get("munb")):
+        return TokenResponse(
+            success=False,
+            message="Cookie 中未找到用户标识（unb/munb）",
         )
 
     # ===== 3. 提取用户 ID 和生成设备 ID =====
@@ -387,7 +421,7 @@ async def invoke_token(
         logger.error(f"提取用户 ID 失败: {e} - IP: {client_ip}")
         return TokenResponse(
             success=False,
-            message=f"Cookie 解析失败: {str(e)}",
+            message="Cookie 解析失败",
         )
 
     # ===== 4. 请求闲鱼 IM Token API =====
@@ -415,7 +449,7 @@ async def invoke_token(
         logger.error(f"闲鱼 API 请求异常: {e} - IP: {client_ip}")
         return TokenResponse(
             success=False,
-            message=f"请求异常: {str(e)}",
+            message="上游请求异常，请查看服务端日志",
         )
 
     # ===== 5. 解析响应 =====
@@ -468,7 +502,7 @@ async def test_connection(
             message="服务未配置 API_KEY",
         )
 
-    if not x_api_key or x_api_key != API_KEY:
+    if not api_key_is_valid(x_api_key):
         return TokenResponse(
             success=False,
             message="API Key 无效",
