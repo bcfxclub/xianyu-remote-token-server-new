@@ -6,6 +6,7 @@
 2. 验证请求头 X-API-Key
 3. 从中国大陆网络出口调用闲鱼 IM Token API
 4. 返回统一格式的响应
+5. （自修复）_m_h5_tk 过期时自动续期并取回 token，避免返回 “令牌过期” 报错
 
 部署：
 - Docker: docker run -e API_KEY=xxx -p 8000:8000 xianyu-remote-token-server
@@ -17,9 +18,10 @@ import hashlib
 import json
 import logging
 import os
+import random
 import secrets
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -32,6 +34,12 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
+
+# Cookie 续期（setLoginSettings）相关，镜像主平台 cookie_renew_api_service
+_PASSPORT_HAS_LOGIN_WEB = "https://passport.goofish.com/newlogin/hasLogin.do"
+_PASSPORT_SILENT_HAS_LOGIN = "https://passport.goofish.com/newlogin/silentHasLogin.do"
+_PASSPORT_SET_LOGIN_SETTINGS = "https://passport.goofish.com/ac/account/setLoginSettings.do"
+_RENEW_REQUEST_TIMEOUT = int(os.environ.get("RENEW_TIMEOUT", "20"))
 
 # 日志配置
 logging.basicConfig(
@@ -137,8 +145,6 @@ def generate_device_id(user_id: str) -> str:
     Returns:
         设备 ID 字符串
     """
-    import random
-
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     result = []
 
@@ -182,7 +188,7 @@ async def request_im_token(
     cookies_str: str,
     device_id: str,
     timeout_seconds: int = 30,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Optional[str]]:
     """调用闲鱼 IM Token API
 
     Args:
@@ -191,7 +197,7 @@ async def request_im_token(
         timeout_seconds: 请求超时秒数
 
     Returns:
-        API 响应 JSON
+        (API 响应 JSON, 本次 mtop 响应重新下发的 _m_h5_tk 或 None)
 
     Raises:
         ValueError: Cookie 格式错误
@@ -272,7 +278,14 @@ async def request_im_token(
         ) as response:
             # 风控响应的 content-type 可能不是 json，统一放开校验避免解析异常
             response_json = await response.json(content_type=None)
-            return response_json
+            # 关键：从 mtop 响应的 Set-Cookie 捕获重新下发的 _m_h5_tk
+            fresh_m_h5_tk = None
+            for sc in response.headers.getall("set-cookie", []):
+                parsed = _parse_single_set_cookie(sc)
+                if parsed and parsed[0] == "_m_h5_tk":
+                    fresh_m_h5_tk = parsed[1]
+                    break
+            return response_json, fresh_m_h5_tk
 
 
 def extract_im_access_token(response_json: Any) -> Optional[str]:
@@ -300,6 +313,181 @@ def extract_im_access_token(response_json: Any) -> Optional[str]:
 
     access_token = data.get("accessToken")
     return access_token if isinstance(access_token, str) and access_token else None
+
+
+# ============= 自修复（_m_h5_tk 续期）辅助函数 =============
+
+
+def _parse_single_set_cookie(raw_cookie: str) -> Optional[Tuple[str, str]]:
+    """解析单个 Set-Cookie 头，返回 (name, value)。"""
+    if not raw_cookie or "=" not in raw_cookie:
+        return None
+    pair = raw_cookie.split(";", 1)[0].strip()
+    if "=" not in pair:
+        return None
+    name, value = pair.split("=", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name:
+        return None
+    return name, value
+
+
+def _replace_cookie_value(cookies_str: str, name: str, value: str) -> str:
+    """把 cookies 字符串中 name 的值替换为 value，返回新的 cookie 字符串。"""
+    cookies = trans_cookies(cookies_str)
+    cookies[name] = value
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def _merge_set_cookies(original_cookies_str: str, set_cookie_headers) -> str:
+    """把响应里的所有 Set-Cookie 合并进原始 cookie 字符串（无差别，含 _m_h5_tk）。"""
+    try:
+        merged = dict(trans_cookies(original_cookies_str) if original_cookies_str else {})
+    except Exception:
+        merged = {}
+    for raw in set_cookie_headers:
+        parsed = _parse_single_set_cookie(raw)
+        if parsed:
+            merged[parsed[0]] = parsed[1]
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
+
+
+def _is_token_expired(response_json: dict) -> bool:
+    """判断 mtop 响应是否为令牌过期/为空（_m_h5_tk 失效）。"""
+    ret = response_json.get("ret", []) or []
+    ret_str = str(ret)
+    return (
+        "FAIL_SYS_TOKEN_EXPIRED" in ret_str
+        or "FAIL_SYS_TOKEN_EMPTY" in ret_str
+        or "令牌过期" in ret_str
+        or "令牌为空" in ret_str
+    )
+
+
+async def _renew_session_cookies(cookies_str: str) -> Optional[str]:
+    """直连 passport.goofish.com 续期会话（hasLogin → silentHasLogin → setLoginSettings）。
+
+    注意：passport 域下不会签发 _m_h5_tk，本函数的作用是刷新登录会话，
+    让随后的 mtop 调用能重新下发 _m_h5_tk。所有域名在国内均可直连。
+    返回合并后的新 cookie 字符串；失败返回 None。
+    """
+    cookie_dict = trans_cookies(cookies_str) if cookies_str else {}
+    xsrf = cookie_dict.get("XSRF-TOKEN", "")
+    unb = cookie_dict.get("unb", "")
+    cookie2 = cookie_dict.get("cookie2", "")
+    tb_token = cookie_dict.get("_tb_token_", "")
+    umid = cookie_dict.get("_uab_collina", "") or cookie_dict.get("cna", "")
+
+    headers_base = {
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        ),
+        "cookie": cookies_str.replace("\n", "").replace("\r", ""),
+    }
+
+    all_set_cookies = []
+    try:
+        async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as session:
+            # 1) hasLogin.do
+            if unb:
+                rnd = str(random.random())
+                page_trace = (
+                    f"21504{int(time.time() * 1000)}{random.randint(100000, 999999)}"
+                )
+                haslogin_headers = dict(headers_base)
+                haslogin_headers.update({
+                    "accept": "application/json, text/plain, */*",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "referer": (
+                        f"https://passport.goofish.com/mini_login.htm?lang=zh_cn"
+                        f"&appName=xianyu&appEntrance=web&styleType=vertical"
+                        f"&bizParams=&notLoadSsoView=false&notKeepLogin=false"
+                        f"&isMobile=false&qrCodeFirst=false&stie=77&rnd={rnd}"
+                    ),
+                })
+                if xsrf:
+                    haslogin_headers["x-xsrf-token"] = xsrf
+                post_data = (
+                    f"hid={unb}&ltl=true&appName=xianyu&appEntrance=web"
+                    f"&_csrf_token={tb_token}&umidToken={umid}&hsiz={cookie2}"
+                    f"&bizParams=taobaoBizLoginFrom%3Dweb%26renderRefer%3Dhttps%253A%252F%252Fwww.goofish.com%252F"
+                    f"&mainPage=false&isMobile=false&lang=zh_CN&returnUrl=&fromSite=77"
+                    f"&isIframe=true&documentReferer=https%3A%2F%2Fwww.goofish.com%2F"
+                    f"&defaultView=hasLogin&umidTag=SERVER&deviceId=&pageTraceId={page_trace}"
+                )
+                try:
+                    async with session.post(
+                        _PASSPORT_HAS_LOGIN_WEB,
+                        params={"appName": "xianyu", "fromSite": "77"},
+                        data=post_data,
+                        headers=haslogin_headers,
+                        timeout=aiohttp.ClientTimeout(total=_RENEW_REQUEST_TIMEOUT),
+                        allow_redirects=False,
+                    ) as resp:
+                        all_set_cookies.extend(resp.headers.getall("Set-Cookie", []))
+                except Exception as e:
+                    logger.warning(f"hasLogin.do 续期异常（忽略）: {e}")
+
+            # 2) silentHasLogin.do
+            silent_headers = dict(headers_base)
+            silent_headers.update({
+                "accept": "*/*",
+                "Referer": "https://www.goofish.com/",
+                "sec-fetch-site": "same-site",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+            })
+            try:
+                async with session.post(
+                    _PASSPORT_SILENT_HAS_LOGIN,
+                    params={
+                        "documentReferer": "https://www.goofish.com/",
+                        "appName": "xianyu",
+                        "appEntrance": "xianyu_sdkSilent",
+                        "fromSite": "0",
+                        "ltl": "true",
+                    },
+                    headers=silent_headers,
+                    timeout=aiohttp.ClientTimeout(total=_RENEW_REQUEST_TIMEOUT),
+                    allow_redirects=False,
+                ) as resp:
+                    all_set_cookies.extend(resp.headers.getall("Set-Cookie", []))
+            except Exception as e:
+                logger.warning(f"silentHasLogin.do 续期异常（忽略）: {e}")
+
+            # 3) setLoginSettings.do（长登录续期）
+            set_headers = dict(headers_base)
+            set_headers.update({
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/x-www-form-urlencoded",
+                "referer": "https://www.goofish.com/",
+                "sec-fetch-site": "same-site",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+            })
+            try:
+                async with session.post(
+                    _PASSPORT_SET_LOGIN_SETTINGS,
+                    params={"fromSite": "77", "appName": "xianyu", "bizEntrance": "web"},
+                    data="status=0",
+                    headers=set_headers,
+                    timeout=aiohttp.ClientTimeout(total=_RENEW_REQUEST_TIMEOUT),
+                    allow_redirects=False,
+                ) as resp:
+                    for sc in resp.headers.getall("Set-Cookie", []):
+                        if "Max-Age=0" not in sc and "1970" not in sc:
+                            all_set_cookies.append(sc)
+            except Exception as e:
+                logger.warning(f"setLoginSettings.do 续期异常（忽略）: {e}")
+    except Exception as e:
+        logger.error(f"会话续期整体异常: {e}")
+        return None
+
+    if not all_set_cookies:
+        return None
+    return _merge_set_cookies(cookies_str, all_set_cookies)
 
 
 # ============= API 端点 =============
@@ -424,10 +612,10 @@ async def invoke_token(
             message="Cookie 解析失败",
         )
 
-    # ===== 4. 请求闲鱼 IM Token API =====
+    # ===== 4. 请求闲鱼 IM Token API（带 _m_h5_tk 自修复）=====
     try:
         logger.info(f"开始请求闲鱼 IM Token API - IP: {client_ip}")
-        response_json = await request_im_token(
+        response_json, fresh_m_h5_tk = await request_im_token(
             cookies,
             device_id,
             timeout_seconds=REQUEST_TIMEOUT,
@@ -452,8 +640,44 @@ async def invoke_token(
             message="上游请求异常，请查看服务端日志",
         )
 
-    # ===== 5. 解析响应 =====
+    # ===== 5. 解析响应；令牌过期则自修复后重试 =====
     access_token = extract_im_access_token(response_json)
+
+    if not access_token and _is_token_expired(response_json):
+        logger.warning(f"检测到令牌过期(_m_h5_tk 失效)，开始自修复 - IP: {client_ip}")
+        # 5.1 优先用本次 mtop 响应重新下发的 _m_h5_tk 直接重试
+        if fresh_m_h5_tk:
+            retry_cookies = _replace_cookie_value(cookies, "_m_h5_tk", fresh_m_h5_tk)
+            try:
+                rj2, _ = await request_im_token(
+                    retry_cookies, device_id, timeout_seconds=REQUEST_TIMEOUT
+                )
+                access_token = extract_im_access_token(rj2)
+                if access_token:
+                    logger.info("使用重新下发的 _m_h5_tk 重试成功")
+            except Exception as e:
+                logger.warning(f"_m_h5_tk 重试异常: {e}")
+        # 5.2 仍失败则用 setLoginSettings 续会话后再取（mtop 会重新下发 _m_h5_tk）
+        if not access_token:
+            renewed = await _renew_session_cookies(cookies)
+            if renewed:
+                try:
+                    rj3, fresh3 = await request_im_token(
+                        renewed, device_id, timeout_seconds=REQUEST_TIMEOUT
+                    )
+                    access_token = extract_im_access_token(rj3)
+                    if not access_token and fresh3:
+                        rj4, _ = await request_im_token(
+                            _replace_cookie_value(renewed, "_m_h5_tk", fresh3),
+                            device_id,
+                            timeout_seconds=REQUEST_TIMEOUT,
+                        )
+                        access_token = extract_im_access_token(rj4)
+                    if access_token:
+                        logger.info("会话续期后取 Token 成功")
+                except Exception as e:
+                    logger.warning(f"会话续期后取 Token 异常: {e}")
+
     if not access_token:
         # 记录完整响应用于调试（但不记录 Cookie）
         ret_msg = response_json.get("ret", ["未知错误"])
